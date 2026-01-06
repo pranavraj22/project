@@ -105,9 +105,18 @@ const App: React.FC = () => {
     } catch (err: any) {
       console.error("Generation Error:", err);
       let msg = "Failed to generate content. Please try again with clearer files.";
-      if (err instanceof Error && err.message.includes("quota")) {
-        msg = "Service busy (Quota Exceeded). Try again in a minute.";
+      
+      // Handle specific error types
+      if (err instanceof Error) {
+        if (err.message.includes("overloaded") || err.message.includes("503")) {
+          msg = "Gemini API is currently overloaded. The system will retry automatically. Please wait a moment...";
+        } else if (err.message.includes("quota") || err.message.includes("429")) {
+          msg = "Rate limit exceeded. Please wait 30-60 seconds before trying again.";
+        } else if (err.message.includes("403")) {
+          msg = "API key issue. Please check your backend configuration.";
+        }
       }
+      
       setApiError(msg);
     } finally {
       setLoading(false);

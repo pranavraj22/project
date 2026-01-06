@@ -1,58 +1,63 @@
-import { GoogleGenAI, Type, Schema } from "@google/genai";
 import { ExamData, UploadedFile, SkillRoadmap } from "../types";
 import { searchWebResources, fetchLatestResources, SearchResult } from "./webScraperService";
 import { sanitizeInput, validateFile } from "../utils/security";
 
-const apiKey = process.env.GEMINI_API_KEY || process.env.Api_name;
-const genAI = new GoogleGenAI({ apiKey: apiKey || "" });
+/**
+ * IMPORTANT SECURITY NOTE
+ *
+ * This module is now a thin client that talks to a backend.
+ * The Gemini API key MUST live only on the backend – never in this file
+ * or anywhere in the browser bundle.
+ *
+ * Configure your backend to expose the following endpoints:
+ *   POST /api/generate-exam
+ *   POST /api/generate-learning-plan
+ *   POST /api/topic-videos
+ *   POST /api/topic-zero-to-hero
+ *   POST /api/skill-roadmap
+ *   POST /api/diagram-image
+ *
+ * Each endpoint should:
+ *   - Read the Gemini API key from secure server-side config/env
+ *   - Call the Gemini API using @google/genai (or HTTP)
+ *   - Return only the safe response payload to the browser
+ */
 
-// Simple memory cache for diagram images
+// In development, Vite proxy handles /api routes
+// In production, set VITE_BACKEND_URL to your backend URL
+const API_BASE =
+  (typeof import.meta !== "undefined" && (import.meta as any).env?.VITE_BACKEND_URL) ||
+  ""; // Empty string means use relative URLs (works with Vite proxy)
+
+const apiFetch = async <T>(
+  path: string,
+  body: any,
+  options: { expectsText?: boolean } = {}
+): Promise<T> => {
+  const url = `${API_BASE}${path}`;
+
+  const res = await fetch(url, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(body),
+  });
+
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(`Backend error (${res.status}): ${text || res.statusText}`);
+  }
+
+  if (options.expectsText) {
+    return (await res.text()) as unknown as T;
+  }
+
+  return (await res.json()) as T;
+};
+
+// Simple memory cache for diagram images (client-side)
 const diagramCache = new Map<string, string>();
-
-const qSchema = {
-  type: Type.OBJECT,
-  properties: {
-    question: { type: Type.STRING },
-    answer: { type: Type.STRING },
-    diagramPrompt: {
-      type: Type.STRING,
-      description: "A descriptive prompt to generate a flowchart, diagram, or visual table if it significantly aids the answer. Leave empty if not needed."
-    },
-  },
-  required: ["question", "answer"],
-};
-
-const examSchema: Schema = {
-  type: Type.OBJECT,
-  properties: {
-    topicName: { type: Type.STRING },
-    veryShortQuestions: {
-      type: Type.ARRAY,
-      items: qSchema,
-    },
-    shortQuestions: {
-      type: Type.ARRAY,
-      items: qSchema,
-    },
-    longQuestions: {
-      type: Type.ARRAY,
-      items: qSchema,
-    },
-    numericals: {
-      type: Type.ARRAY,
-      items: qSchema,
-    },
-    examinerNotes: {
-      type: Type.ARRAY,
-      items: { type: Type.STRING },
-    },
-    youtubeQueries: {
-      type: Type.ARRAY,
-      items: { type: Type.STRING },
-    },
-  },
-  required: ["topicName", "veryShortQuestions", "shortQuestions", "longQuestions", "examinerNotes", "youtubeQueries"],
-};
 
 export const generateExamContent = async (
   lectureFiles: UploadedFile[],
@@ -75,8 +80,6 @@ export const generateExamContent = async (
     examType: sanitizeInput(details.examType),
     units: details.units ? sanitizeInput(details.units) : undefined
   };
-
-  const model = "gemini-2.5-flash";
 
   let specificInstructions = "";
 
@@ -324,12 +327,12 @@ No meta text.
   - Prefer exam-relevant framing over textbook-style questions.
   - Avoid vague or generic questions.
 
-  QUANTITY REQUIREMENTS (MANDATORY):
- 
-  - Very Short Questions: minimum 25–30 (if applicable)
-  - Short Answer Questions: minimum 20–25 (Adjust questions based on exam type as per college exam pattern)
-  - Long Answer Questions: minimum 15–20 (Adjust questions based on exam type as per college exam pattern)
-  - Numerical / Problem-Solving: minimum 50–55 (Critical for Competitive Exams)
+  QUANTITY REQUIREMENTS (BALANCED FOR SPEED + COVERAGE):
+  - Aim for a good spread of questions without making the paper unnecessarily long.
+  - Very Short Questions: around 12–15 (if applicable)
+  - Short Answer Questions: around 10–12 (Adjust based on exam type / pattern)
+  - Long Answer Questions: around 6–8 (Adjust based on exam type / pattern)
+  - Numerical / Problem-Solving: around 15–20 (focus more only for Competitive Exams)
 
     For each question, provide a high-scoring, keyword-rich answer following the structure rule.
     Include examiner notes on marks-saving tips.
@@ -343,38 +346,15 @@ No meta text.
     Generate the response in JSON format matching the schema provided.
   `;
 
-  try {
-    const lectureParts = validLectureFiles.map(file => ({
-      inlineData: { data: file.base64, mimeType: file.mimeType },
-    }));
+  // Send to backend – backend will call Gemini securely
+  const payload = {
+    lectureFiles: validLectureFiles,
+    syllabusFiles: validSyllabusFiles,
+    details: safeDetails,
+    prompt,
+  };
 
-    const syllabusParts = validSyllabusFiles.map(file => ({
-      inlineData: { data: file.base64, mimeType: file.mimeType },
-    }));
-
-    const response = await genAI.models.generateContent({
-      model,
-      contents: {
-        parts: [
-          ...syllabusParts,
-          ...lectureParts,
-          { text: prompt },
-        ],
-      },
-      config: {
-        responseMimeType: "application/json",
-        responseSchema: examSchema,
-      },
-    });
-
-    const text = response.text;
-    if (!text) throw new Error("No response from Gemini");
-
-    return JSON.parse(text) as ExamData;
-  } catch (error) {
-    console.error("Gemini API Error:", error);
-    throw error;
-  }
+  return await apiFetch<ExamData>("/api/generate-exam", payload);
 };
 
 export const generateDiagramImage = async (prompt: string, checkCacheOnly: boolean = false): Promise<string | null> => {
@@ -386,21 +366,16 @@ export const generateDiagramImage = async (prompt: string, checkCacheOnly: boole
     return null;
   }
 
-  const model = "gemini-2.5-flash-image";
   try {
-    const response = await genAI.models.generateContent({
-      model,
-      contents: {
-        parts: [{ text: `Generate a clear educational diagram: ${prompt}. Legible labels, white background.` }],
-      },
-    });
+    const result = await apiFetch<{ imageBase64?: string | null }>(
+      "/api/diagram-image",
+      { prompt }
+    );
 
-    for (const part of response.candidates?.[0]?.content?.parts || []) {
-      if (part.inlineData) {
-        const base64Data = `data:image/png;base64,${part.inlineData.data}`;
-        diagramCache.set(prompt, base64Data);
-        return base64Data;
-      }
+    if (result?.imageBase64) {
+      const base64Data = `data:image/png;base64,${result.imageBase64}`;
+      diagramCache.set(prompt, base64Data);
+      return base64Data;
     }
     return null;
   } catch (error) {
@@ -423,8 +398,6 @@ export const generateLearningPlan = async (
   const safeCollege = sanitizeInput(college);
   const safeSubject = sanitizeInput(subject);
   const safeSemester = sanitizeInput(semester);
-
-  const model = "gemini-2.5-flash";
 
   const prompt = `
 ROLE:
@@ -553,20 +526,18 @@ Return ONLY the learning path content.
 Do NOT include explanations, reasoning steps, or meta commentary.
 `;
 
-  try {
-    const fileParts = validSyllabusFiles.map(file => ({
-      inlineData: { data: file.base64, mimeType: file.mimeType },
-    }));
+  const payload = {
+    syllabusFiles: validSyllabusFiles,
+    college: safeCollege,
+    subject: safeSubject,
+    semester: safeSemester,
+    pyqInfo,
+    prompt,
+  };
 
-    const response = await genAI.models.generateContent({
-      model,
-      contents: { parts: [...fileParts, { text: prompt }] },
-    });
-    return response.text || "Failed to generate plan.";
-  } catch (error) {
-    console.error("Plan Error:", error);
-    throw error;
-  }
+  return await apiFetch<string>("/api/generate-learning-plan", payload, {
+    expectsText: true,
+  });
 };
 
 export interface ClarifierVideo {
@@ -578,7 +549,6 @@ export interface ClarifierVideo {
 
 export const getTopicVideoResources = async (topic: string): Promise<ClarifierVideo[]> => {
   const safeTopic = sanitizeInput(topic);
-  const model = "gemini-2.5-flash-lite";
   const prompt = `Find 5 best free educational video resources for the topic: "${safeTopic}".
   Focus on high-quality explanations (English, Hindi, or Telugu).
   
@@ -593,27 +563,10 @@ export const getTopicVideoResources = async (topic: string): Promise<ClarifierVi
   ]`;
 
   try {
-    const response = await genAI.models.generateContent({
-      model,
-      contents: { parts: [{ text: prompt }] },
-      config: {
-        responseMimeType: "application/json",
-        responseSchema: {
-          type: Type.ARRAY,
-          items: {
-            type: Type.OBJECT,
-            properties: {
-              title: { type: Type.STRING },
-              channel: { type: Type.STRING },
-              description: { type: Type.STRING },
-              searchQuery: { type: Type.STRING },
-            },
-            required: ["title", "channel", "description", "searchQuery"]
-          }
-        }
-      }
+    return await apiFetch<ClarifierVideo[]>("/api/topic-videos", {
+      topic: safeTopic,
+      prompt,
     });
-    return JSON.parse(response.text || "[]") as ClarifierVideo[];
   } catch (error) {
     console.error("Video Error:", error);
     return [];
@@ -622,7 +575,6 @@ export const getTopicVideoResources = async (topic: string): Promise<ClarifierVi
 
 export const getTopicZeroToHero = async (topic: string): Promise<string> => {
   const safeTopic = sanitizeInput(topic);
-  const model = "gemini-2.5-flash";
   const prompt = `You are an expert academic curriculum analyst.
   
   INPUT: Topic Name: ${safeTopic}
@@ -671,11 +623,10 @@ export const getTopicZeroToHero = async (topic: string): Promise<string> => {
   `;
 
   try {
-    const response = await genAI.models.generateContent({
-      model,
-      contents: { parts: [{ text: prompt }] },
-    });
-    return response.text || "Failed to generate explanation.";
+    return await apiFetch<string>("/api/topic-zero-to-hero", {
+      topic: safeTopic,
+      prompt,
+    }, { expectsText: true });
   } catch (error) {
     console.error("Hero Error:", error);
     throw error;
@@ -736,96 +687,12 @@ export const searchLatestResources = async (
 // Re-export types for convenience
 export type { SearchResult } from "./webScraperService";
 
-const roadmapSchema: Schema = {
-  type: Type.OBJECT,
-  properties: {
-    overview: { type: Type.STRING },
-    youtubeFoundation: {
-      type: Type.OBJECT,
-      properties: {
-        beginner: {
-          type: Type.ARRAY,
-          items: {
-            type: Type.OBJECT,
-            properties: {
-              title: { type: Type.STRING },
-              channel: { type: Type.STRING },
-              searchQuery: { type: Type.STRING },
-            },
-            required: ["title", "channel", "searchQuery"]
-          }
-        },
-        intermediate: {
-          type: Type.ARRAY,
-          items: {
-            type: Type.OBJECT,
-            properties: {
-              title: { type: Type.STRING },
-              channel: { type: Type.STRING },
-              searchQuery: { type: Type.STRING },
-            },
-            required: ["title", "channel", "searchQuery"]
-          }
-        },
-        advanced: {
-          type: Type.ARRAY,
-          items: {
-            type: Type.OBJECT,
-            properties: {
-              title: { type: Type.STRING },
-              channel: { type: Type.STRING },
-              searchQuery: { type: Type.STRING },
-            },
-            required: ["title", "channel", "searchQuery"]
-          }
-        }
-      },
-      required: ["beginner", "intermediate", "advanced"]
-    },
-    learningPath: {
-      type: Type.ARRAY,
-      items: {
-        type: Type.OBJECT,
-        properties: {
-          step: { type: Type.STRING },
-          description: { type: Type.STRING },
-          practice: { type: Type.STRING },
-        },
-        required: ["step", "description", "practice"]
-      }
-    },
-    researchPapers: {
-      type: Type.ARRAY,
-      items: {
-        type: Type.OBJECT,
-        properties: {
-          title: { type: Type.STRING },
-          link: { type: Type.STRING },
-          summary: { type: Type.STRING },
-        },
-        required: ["title", "link", "summary"]
-      }
-    },
-    dependencyMap: {
-      type: Type.OBJECT,
-      properties: {
-        prerequisites: { type: Type.ARRAY, items: { type: Type.STRING } },
-        currentSkill: { type: Type.STRING },
-        advancedTopics: { type: Type.ARRAY, items: { type: Type.STRING } },
-      },
-      required: ["prerequisites", "currentSkill", "advancedTopics"]
-    },
-  },
-  required: ["overview", "youtubeFoundation", "learningPath", "researchPapers", "dependencyMap"],
-};
-
 export const generateSkillRoadmap = async (
   topic: string,
   goal: string
 ): Promise<SkillRoadmap> => {
   const safeTopic = sanitizeInput(topic);
   const safeGoal = sanitizeInput(goal);
-  const model = "gemini-2.5-flash";
 
   const prompt = `
     ROLE: You are an elite academic mentor and industry specialist.
@@ -872,19 +739,11 @@ For each paper:
   `;
 
   try {
-    const response = await genAI.models.generateContent({
-      model,
-      contents: { parts: [{ text: prompt }] },
-      config: {
-        responseMimeType: "application/json",
-        responseSchema: roadmapSchema,
-      },
+    return await apiFetch<SkillRoadmap>("/api/skill-roadmap", {
+      topic: safeTopic,
+      goal: safeGoal,
+      prompt,
     });
-
-    const text = response.text;
-    if (!text) throw new Error("No response from Gemini");
-
-    return JSON.parse(text) as SkillRoadmap;
   } catch (error) {
     console.error("Skill Roadmap Error:", error);
     throw error;
